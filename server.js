@@ -1,237 +1,317 @@
-import { createServer } from "http";
-import { Server } from "socket.io";
-import express from "express";
-import cors from "cors";
+const express = require('express');
+const { createServer } = require('http');
+const { Server } = require('socket.io');
+const axios = require('axios');
+const path = require('path');
+const { performance } = require('perf_hooks'); // Nécessaire pour les minuteurs précis
 
+// Configuration du serveur
 const app = express();
-app.use(cors());
-
-const server = createServer(app);
-const io = new Server(server, {
-    cors: { origin: "http://localhost:3000", methods: ["GET", "POST"] },
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+    cors: {
+        origin: "*", // Permettre toutes les origines pour le développement
+        methods: ["GET", "POST"]
+    }
 });
 
-// =======================================================
-// 🚨 CONFIGURATION API PHP (Vérifiez le port !)
-// =======================================================
-const PHP_HOST = "http://localhost:8000";
-const QUESTIONS_API_URL = `${PHP_HOST}/api/quiz/questions`;
-const ANSWER_API_URL = `${PHP_HOST}/api/quiz/answer`;
-const DELETE_QUESTIONS_API_URL = `${PHP_HOST}/api/questions/delete`;
+const PORT = 3001;
+const PHP_API_URL = 'http://localhost:8000/api'; // Assurez-vous que l'URL est correcte
 
-let players = []; 
+// ------------------------------------------
+// État du Jeu Global
+// ------------------------------------------
+let connectedPlayers = [];
 let gameStarted = false;
+let currentQuestionIndex = 0;
+let questions = [];
+let questionTimer = null; // Référence au minuteur Node.js (pour le délai)
 
-// VARIABLES QUIZ CENTRALES
-let questions = []; 
-let currentQuestionIndex = -1; 
-let questionTimer = null; 
-const TIME_PER_QUESTION = 10; 
-const REVEAL_TIME = 3000; 
+// Suivi des réponses soumises pendant le temps imparti
+let currentAnswers = {}; // { socketId: { question_id: string, answer: string } }
+let correctAnswerData = {}; // { question_id: string, correctAnswer: string }
 
+const QUESTION_TIME_LIMIT = 15; // 15 secondes par question
 
-// === Fonctions de Contrôle et API === 
+// Fonction utilitaire pour appeler l'API PHP
+async function fetchPhpApi(endpoint, data = {}) {
+    try {
+        const response = await axios.post(`${PHP_API_URL}${endpoint}`, data);
+        return response.data;
+    } catch (error) {
+        console.error(`Erreur lors de l'appel à l'API PHP ${endpoint}:`, error.response ? error.response.data : error.message);
+        return { error: 'Erreur d\'API' };
+    }
+}
 
-const deletePlayedQuestions = async (ids) => {
-    if (ids.length === 0) return;
-    
-    try {
-        await fetch(DELETE_QUESTIONS_API_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ids }),
-        });
-        console.log(`[ADMIN] ✅ Questions ${ids.join(', ')} supprimées de la BDD.`);
-    } catch (err) {
-        console.error("🚫 Erreur suppression:", err.message);
-    }
-}; 
+// Mettre à jour et émettre l'état des joueurs
+async function updatePlayersState() {
+    try {
+        const response = await axios.get(`${PHP_API_URL}/players/ready-list`);
+        const dbPlayers = response.data;
 
-const loadAndConsumeQuestions = async () => {
-    questions = []; 
-    try {
-        const res = await fetch(QUESTIONS_API_URL);
-        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-        const data = await res.json();
-        
-        if (Array.isArray(data) && data.length > 0) {
-            questions = data;
-            await deletePlayedQuestions(data.map(q => q.id)); 
-            return questions.length;
-        } else {
-            console.warn("❌ Aucune question valide reçue de l'API.");
-            return 0;
-        }
-    } catch (err) {
-        console.error("❌ Erreur critique au fetch des questions:", err.message);
-        return 0;
-    }
-}; 
+        // Assurez-vous que les joueurs connectés sont mis à jour avec les infos BDD
+        const newPlayersState = dbPlayers.map(dbPlayer => {
+            // Trouver l'état de connexion Socket.io
+            const connectedPlayer = connectedPlayers.find(p => p.pseudo === dbPlayer.pseudo);
+            
+            if (!connectedPlayer) return null; // Ignorer les joueurs de la BDD qui ne sont pas connectés via socket
 
-/** Diffuse la liste des joueurs avec leurs scores et statuts mis à jour. */
-const updatePlayers = () => {
-    io.emit("players_update", players.map(p => ({
-        id: p.id,
-        pseudo: p.pseudo,
-        ready: p.ready,
-        is_admin: p.is_admin,
-        score: p.score,
-        has_answered_current_q: p.has_answered_current_q // Utile pour le front
-    })));
-} 
+            return {
+                id: connectedPlayer.id, 
+                participantId: connectedPlayer.participantId, // L'ID BDD original du joueur
+                pseudo: dbPlayer.pseudo,
+                score: parseInt(dbPlayer.score || 0),
+                is_admin: dbPlayer.is_admin,
+                is_ready: dbPlayer.is_ready,
+                // Vérifier si le joueur a soumis une réponse pour la question actuelle
+                has_answered_current_q: !!currentAnswers[connectedPlayer.id],
+            };
+        }).filter(p => p !== null); 
 
-const revealAnswer = (question) => {
-    io.emit("reveal_answer", {
-        correctAnswer: question.correct_answer || "Erreur",
-        nextQuestionTime: REVEAL_TIME 
-    });
-    console.log(`[QUIZ] 📢 Révélation de la réponse.`);
-    setTimeout(nextQuestion, REVEAL_TIME); 
-} 
-
-const nextQuestion = () => {
-    if (questionTimer) {
-        clearTimeout(questionTimer);
-    }
-
-    currentQuestionIndex++;
-    
-    if (currentQuestionIndex < questions.length) {
-        // Réinitialiser le statut de réponse
-        players = players.map(p => ({...p, has_answered_current_q: false}));
-        updatePlayers(); // Diffuser l'état de début de question
-        
-        const question = questions[currentQuestionIndex];
-        io.emit("new_question", {
-            id: question.id, 
-            questionNumber: currentQuestionIndex + 1,
-            questionText: question.question,
-            options: question.answers, 
-            totalQuestions: questions.length,
-            timeLimit: TIME_PER_QUESTION
-        });
-        
-        console.log(`[QUIZ] ➡️ Question ${currentQuestionIndex + 1} envoyée.`);
-        questionTimer = setTimeout(() => { revealAnswer(question); }, TIME_PER_QUESTION * 1000); 
-    } else {
-        // Fin du quiz
-        const finalScores = players.map(p => ({ pseudo: p.pseudo, score: p.score })).sort((a, b) => b.score - a.score);
-        io.emit("final_scores", finalScores); 
-        io.emit("quiz_end");
-        console.log("🚀 Quiz terminé.");
-        gameStarted = false;
-        currentQuestionIndex = -1;
-    }
-} 
+        connectedPlayers = newPlayersState;
+        io.emit('players_update', connectedPlayers);
+    } catch (error) {
+        console.error("Erreur lors de la mise à jour des joueurs:", error.message);
+    }
+}
 
 
-// === Événements Socket.io === 
-io.on("connection", (socket) => {
-    console.log(`🟢 Nouveau joueur connecté: ${socket.id.substring(0, 4)}...`);
+// Démarrer la routine de la question
+async function startQuestionRound() {
+    if (currentQuestionIndex >= questions.length) {
+        // Fin du jeu
+        return endGame();
+    }
 
-    // 🔹 Le joueur rejoint le lobby
-    socket.on("join_lobby", ({ pseudo, participantId }) => { 
-        if (players.some(p => p.id === socket.id)) return;
-        
-        const isAdmin = players.length === 0; 
-        players.push({ 
-            id: socket.id, 
-            participant_id_bdd: participantId, // 🔑 STOCKAGE DE L'ID BDD
-            pseudo, 
-            ready: isAdmin, 
-            is_admin: isAdmin,
-            score: 0,
-            has_answered_current_q: false
-        });
-        
-        updatePlayers(); 
-    });
+    const currentQ = questions[currentQuestionIndex];
+    
+    // Réinitialiser l'état des réponses et du score correct
+    currentAnswers = {}; 
+    correctAnswerData = {};
 
-    // 🔹 Joueur indique qu'il est prêt
-    socket.on("player_ready", () => {
-        players = players.map((p) =>
-            p.id === socket.id ? { ...p, ready: true } : p
-        );
-        updatePlayers(); 
-    });
-    
-    // 🔹 Joueur envoie sa réponse
-    socket.on("player_answer", async ({ question_id, answer }) => {
-        if (!gameStarted || currentQuestionIndex === -1) return;
+    console.log(`Démarrage question ${currentQuestionIndex + 1}: ${currentQ.question}`);
+    
+    // Émission de la nouvelle question
+    io.emit('new_question', {
+        questionNumber: currentQuestionIndex + 1,
+        totalQuestions: questions.length,
+        id: currentQ.id,
+        questionText: currentQ.question,
+        options: currentQ.answers, // Utilise la clé 'answers' reçue du PHP
+        timeLimit: QUESTION_TIME_LIMIT
+    });
+    
+    // Lancer le minuteur qui DÉCLENCHERA LE SCORING (l'événement crucial)
+    if (questionTimer) clearTimeout(questionTimer);
+    questionTimer = setTimeout(processQuestionEnd, QUESTION_TIME_LIMIT * 1000);
 
-        const player = players.find(p => p.id === socket.id);
-        
-        if (!player || player.has_answered_current_q) return;
-        
-        // 1. Marquer le joueur comme ayant répondu immédiatement 
-        player.has_answered_current_q = true; 
-        updatePlayers(); 
+    // Mettre à jour l'état des joueurs (pour réinitialiser l'indicateur "answered")
+    updatePlayersState();
+}
 
-        try {
-            const res = await fetch(ANSWER_API_URL, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    player_id: player.participant_id_bdd, // 🔑 Utilisation de l'ID BDD
-                    question_id,
-                    answer: answer, 
-                }),
-            });
+/**
+ * Fonction appelée lorsque le minuteur de la question expire.
+ * C'est ici que nous vérifions les réponses et mettons à jour les scores.
+ */
+async function processQuestionEnd() {
+    // Annuler le minuteur pour éviter les doubles exécutions
+    if (questionTimer) clearTimeout(questionTimer);
+    
+    const currentQ = questions[currentQuestionIndex];
+    if (!currentQ) return;
+    
+    const questionId = currentQ.id;
+    let finalCorrectAnswer = null;
 
-            if (!res.ok) throw new Error(`API call failed with status: ${res.status}`);
+    console.log(`Minuteur terminé. Traitement des ${Object.keys(currentAnswers).length} réponses soumises.`);
 
-            const data = await res.json();
-            const isCorrect = data.is_correct || false;
+    // --- 1. Vérification et Scoring (Score Incrémenté MAINTENANT) ---
+    for (const socketId in currentAnswers) {
+        const answerText = currentAnswers[socketId].answer;
+        const player = connectedPlayers.find(p => p.id === socketId);
+        
+        if (player) {
+            // APPEL PHP POUR SCORING : Le score BDD est mis à jour ici, APRÈS le délai
+            const phpResult = await fetchPhpApi('/quiz/answer', {
+                player_id: player.participantId, 
+                question_id: questionId,
+                answer: answerText
+            });
 
-            if (isCorrect) {
-                // 2. Mise à jour du score local (en mémoire)
-                player.score += (data.score_earned || 1); 
-                console.log(`[SCORE] ${player.pseudo} a bien répondu. Nouveau score: ${player.score}`);
-            }
-            
-            socket.emit("feedback_answer", { isCorrect, submittedAnswer: answer }); 
-            updatePlayers(); // 3. Diffuser les nouveaux scores
-            
+            // Stocker la réponse correcte pour l'étape de révélation
+            if (phpResult && phpResult.correct_answer) {
+                finalCorrectAnswer = phpResult.correct_answer;
+            }
 
-        } catch (err) {
-            console.error("Erreur critique lors de la vérification de réponse:", err.message);
-        }
-    });
-
-
-    // 🔹 Admin lance la partie
-    socket.on("start_game", async () => {
-        const adminPlayer = players.find(p => p.id === socket.id && p.is_admin);
-        if (!adminPlayer || gameStarted) return;
-        
-        const questionCount = await loadAndConsumeQuestions();
-        
-        if (questionCount > 0) {
-            gameStarted = true;
-            players = players.map(p => ({...p, score: 0, has_answered_current_q: false})); 
-            console.log("🚀 Partie lancée !");
-            io.emit("game_start"); 
-            setTimeout(nextQuestion, 2000); 
-        } else {
-            console.warn('🚫 Lancement annulé: 0 questions disponibles.');
+            // Émettre le feedback individuel (pour mettre à jour le score sur le front-end)
+            io.to(socketId).emit('feedback_answer', {
+                isCorrect: phpResult.is_correct || false,
+                correctAnswer: finalCorrectAnswer || ''
+            });
         }
-    });
+    }
+    
+    // Fallback pour récupérer la réponse correcte si personne n'a répondu
+    if (!finalCorrectAnswer) {
+         const phpResult = await fetchPhpApi('/quiz/answer', { 
+                player_id: 0, 
+                question_id: questionId,
+                answer: ""
+            });
+         if (phpResult && phpResult.correct_answer) {
+                finalCorrectAnswer = phpResult.correct_answer;
+         }
+    }
 
-    // 🔹 Joueur se déconnecte 
-    socket.on("disconnect", () => {
-        const wasAdmin = players.find(p => p.id === socket.id)?.is_admin;
-        players = players.filter((p) => p.id !== socket.id);
-        
-        if (wasAdmin && players.length > 0) {
-            players[0].is_admin = true;
-            players[0].ready = true;
-        }
+    // --- 2. Révélation de la Réponse à tous ---
+    if (finalCorrectAnswer) {
+        io.emit('reveal_answer', { correctAnswer: finalCorrectAnswer });
+    }
 
-        updatePlayers(); 
-    });
-}); 
+    // --- 3. Préparation pour la prochaine question ---
+    // CET APPEL MET À JOUR LE SCORE SUR TOUS LES CLIENTS AVEC LA VALEUR DE LA BDD
+    await updatePlayersState(); 
+
+    currentQuestionIndex++;
+    
+    // Démarrer la prochaine question après un court délai pour la visualisation (e.g., 5 secondes)
+    setTimeout(startQuestionRound, 5000); 
+}
 
 
-server.listen(8001, () => {
-    console.log("🟢 Serveur WebSocket lancé sur le port 8001");
+// Logique de fin de jeu
+async function endGame() {
+    gameStarted = false;
+    currentQuestionIndex = 0;
+    questions = [];
+    currentAnswers = {};
+    if (questionTimer) clearTimeout(questionTimer);
+
+    console.log("Jeu terminé. Envoi des scores finaux.");
+
+    // Récupérer le classement final
+    try {
+        const response = await axios.get(`${PHP_API_URL}/leaderboard`);
+        const finalScores = response.data;
+        io.emit('final_scores', finalScores);
+        io.emit('quiz_end');
+        
+        // Réinitialiser l'état du jeu dans la BDD
+        await axios.post(`${PHP_API_URL}/game/reset`); // Supposons que cette route existe
+    } catch (error) {
+        console.error("Erreur lors de la récupération du classement:", error.message);
+    }
+}
+
+
+// ------------------------------------------
+// Gestion des Sockets (Connexions/Événements)
+// ------------------------------------------
+io.on('connection', (socket) => {
+    console.log(`Utilisateur connecté: ${socket.id}`);
+
+    // Synchroniser l'état initial des joueurs
+    updatePlayersState(); 
+
+    // Gérer l'état initial du jeu
+    axios.get(`${PHP_API_URL}/game/status`).then(res => {
+        if (res.data.started) {
+             socket.emit('game_started');
+        }
+    });
+
+    socket.on('disconnect', () => {
+        console.log(`Utilisateur déconnecté: ${socket.id}`);
+        // Retirer le joueur déconnecté du tableau, basé sur l'ID socket
+        connectedPlayers = connectedPlayers.filter(p => p.id !== socket.id);
+        updatePlayersState(); // Mise à jour pour les autres clients
+    });
+
+    socket.on('player_info', (playerInfo) => {
+        // Enregistrer l'ID socket du joueur pour le suivi en temps réel
+        if (playerInfo && !connectedPlayers.find(p => p.id === socket.id)) {
+            connectedPlayers.push({
+                id: socket.id,
+                participantId: playerInfo.participantId, // ID BDD du participant
+                pseudo: playerInfo.pseudo,
+                is_admin: playerInfo.is_admin,
+                score: 0,
+                is_ready: false,
+                has_answered_current_q: false,
+            });
+            updatePlayersState();
+        }
+    });
+    
+    // ************************************************
+    // TRAITEMENT DE LA RÉPONSE : CACHÉE (PAS DE SCORING IMMÉDIAT)
+    // ************************************************
+    socket.on('player_answer', (data) => {
+        const player = connectedPlayers.find(p => p.id === socket.id);
+        
+        // Vérifier si la question est active et si le joueur n'a pas déjà répondu
+        if (gameStarted && player && currentQuestionIndex < questions.length && !currentAnswers[socket.id]) {
+            const currentQ = questions[currentQuestionIndex];
+            
+            if (data.question_id === currentQ.id) {
+                // Stocker la réponse dans le cache
+                currentAnswers[socket.id] = {
+                    question_id: data.question_id,
+                    answer: data.answer
+                };
+                
+                console.log(`Réponse cachée pour ${player.pseudo}. ID: ${data.question_id}`);
+                
+                // Mettre à jour l'état visuel "a répondu"
+                updatePlayersState(); 
+            }
+        }
+    });
+    
+    // Gérer le signal de début de partie par l'administrateur
+    socket.on('start_game_request', async () => {
+        if (gameStarted) return; 
+
+        // Récupérer les 10 questions aléatoires via l'API PHP (qui gère l'unicité)
+        questions = await fetchPhpApi('/quiz/questions', { userId: 1 });
+        
+        if (questions.length === 0) {
+            console.log("Pas de questions disponibles.");
+            io.emit('error_message', '❌ Aucune question valide reçue de l\'API. Le stock est vide.');
+            return;
+        }
+
+        // Réinitialiser les scores des joueurs avant le début
+        await fetchPhpApi('/game/reset_scores'); 
+        
+        gameStarted = true;
+        currentQuestionIndex = 0;
+        
+        io.emit('game_started'); // Notifier tous les clients
+        startQuestionRound(); // Démarrer la première question
+    });
+});
+
+// Middleware pour la réinitialisation de l'état
+app.post('/api/game/reset', async (req, res) => {
+    gameStarted = false;
+    currentQuestionIndex = 0;
+    questions = [];
+    currentAnswers = {};
+    if (questionTimer) clearTimeout(questionTimer);
+    
+    try {
+        // Réinitialisation des états is_ready et game_started dans la BDD
+        await axios.post(`${PHP_API_URL}/game/reset-participants-state`); 
+        return res.json({ success: true, message: 'Jeu réinitialisé' });
+    } catch (error) {
+        console.error("Erreur lors de la réinitialisation de la BDD:", error.message);
+        return res.status(500).json({ error: 'Erreur de réinitialisation BDD' });
+    }
+});
+
+
+httpServer.listen(PORT, () => {
+    console.log(`Serveur Node.js en cours d'exécution sur le port ${PORT}`);
 });
