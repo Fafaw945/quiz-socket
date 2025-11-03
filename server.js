@@ -14,10 +14,10 @@ const io = new Server(httpServer, {
     }
 });
 
-// URL de l'API PHP (Heroku ou locale)
+
 // IMPORTANT : L'URL Heroku est définie ici si la variable d'environnement PHP_API_URL n'est pas présente.
-// L'URL de base est : https://quiz-api-fafaw945.herokuapp.com/
-const PHP_API_URL = process.env.PHP_API_URL || 'https://quiz-api-fafaw945.herokuapp.com'; 
+// L'URL de base est : https://quiz-api-79jx.onrender.com/
+const PHP_API_URL = process.env.PHP_API_URL || 'https://quiz-api-79jx.onrender.com/'; 
 const PORT = process.env.PORT || 3001;
 
 // ------------------------------------------
