@@ -1,354 +1,345 @@
+// server.js (version corrigée)
 const express = require('express');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 const axios = require('axios');
 const path = require('path');
 
-// Configuration du serveur
 const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-    cors: {
-        origin: "*", // À configurer pour l'URL de votre frontend en production
-        methods: ["GET", "POST"]
-    }
+  cors: {
+    origin: "*", // change en production pour l'URL frontend
+    methods: ["GET", "POST"]
+  }
 });
 
-// ==========================================================
-// 💡 CORRECTION 1 : Retrait de la barre oblique (/) finale
-// ==========================================================
-const PHP_API_URL = process.env.PHP_API_URL || 'https://quiz-api-79jx.onrender.com'; 
+const PHP_API_URL = process.env.PHP_API_URL || 'https://quiz-api-79jx.onrender.com';
 const PORT = process.env.PORT || 3001;
 
-// ------------------------------------------
-// État du Jeu Global
-// ------------------------------------------
-let connectedPlayers = []; // Stocke les joueurs actuellement connectés par socket.id
+// État du jeu global
+let connectedPlayers = []; // { id: socketId, participantId, pseudo, is_admin, score, is_ready, has_answered_current_q }
 let gameStarted = false;
 let currentQuestionIndex = 0;
-let questions = []; // Cache des 10 questions récupérées de l'API
-let questionTimer = null; 
+let questions = [];
+let questionTimer = null;
+let currentAnswers = {};
 
-let currentAnswers = {}; 
+const QUESTION_TIME_LIMIT = 15;
+const REVEAL_TIME = 5000;
 
-const QUESTION_TIME_LIMIT = 15; // 15 secondes par question
-const REVEAL_TIME = 5000; // 5 secondes pour la révélation de la réponse
-
-// Fonction utilitaire pour appeler l'API PHP (POST par défaut)
 async function fetchPhpApi(endpoint, data = null, method = 'POST') {
-    try {
-        // L'URL est maintenant correcte (ex: ...onrender.com/api/...)
-        const url = `${PHP_API_URL}/api${endpoint}`; 
-        let response;
-
-        if (method === 'POST') {
-            response = await axios.post(url, data);
-        } else if (method === 'GET') {
-             response = await axios.get(url);
-        }
-        
-        return response.data;
-    } catch (error) {
-        console.error(`Erreur lors de l'appel à l'API PHP ${endpoint}:`, error.response ? error.response.data : error.message);
-        return { error: 'Erreur d\'API' };
-    }
-}
-
-// ==========================================================
-// 💡 CORRECTION 2 : Fonction updatePlayersState remplacée
-// (Fusionne l'état BDD et l'état Mémoire)
-// ==========================================================
-async function updatePlayersState() {
-    try {
-        const dbPlayers = await fetchPhpApi('/players/ready-list', null, 'GET'); 
-
-        if (!Array.isArray(dbPlayers)) {
-             console.error("Erreur: /api/players/ready-list n'a pas retourné un tableau. Réponse:", dbPlayers);
-             return; 
-        }
-
-        // Créer une map de l'état en mémoire (la source de vérité pour 'is_ready')
-        const inMemoryState = new Map();
-        for (const player of connectedPlayers) {
-            inMemoryState.set(player.participantId, {
-                id: player.id, // ID Socket
-                is_ready: player.is_ready, // <-- L'état 'ready' de la session en cours
-                has_answered_current_q: player.has_answered_current_q
-            });
-        }
-
-        const newPlayersState = dbPlayers.map(dbPlayer => {
-            // Récupérer l'état en mémoire pour ce joueur (par son ID de BDD)
-            const memoryPlayer = inMemoryState.get(dbPlayer.id); // On compare l'ID BDD
-            
-            if (!memoryPlayer) return null; // Joueur déconnecté
-
-            return {
-                // Données de la BDD (persistantes)
-                participantId: dbPlayer.id,
-                pseudo: dbPlayer.pseudo,
-                score: parseInt(dbPlayer.score || 0),
-                is_admin: !!dbPlayer.is_admin,
-                
-                // Données de la Mémoire (session actuelle)
-                id: memoryPlayer.id, // ID Socket
-                is_ready: memoryPlayer.is_ready, // <-- Utiliser l'état 'ready' de la mémoire
-                has_answered_current_q: memoryPlayer.has_answered_current_q,
-            };
-        }).filter(p => p !== null); 
-
-        connectedPlayers = newPlayersState;
-        io.emit('players_update', connectedPlayers);
-    } catch (error) {
-        console.error("Erreur lors de la mise à jour des joueurs:", error.message);
-    }
-}
-
-
-// Démarrer la routine de la question
-async function startQuestionRound() {
-    if (currentQuestionIndex >= questions.length) {
-        return endGame();
-    }
-
-    const currentQ = questions[currentQuestionIndex];
-    
-    currentAnswers = {}; 
-
-    console.log(`Démarrage question ${currentQuestionIndex + 1}: ${currentQ.question}`);
-    
-    io.emit('new_question', {
-        questionNumber: currentQuestionIndex + 1,
-        totalQuestions: questions.length,
-        id: currentQ.id,
-        questionText: currentQ.question,
-        options: currentQ.answers, 
-        timeLimit: QUESTION_TIME_LIMIT
-    });
-    
-    if (questionTimer) clearTimeout(questionTimer);
-    questionTimer = setTimeout(processQuestionEnd, QUESTION_TIME_LIMIT * 1000);
-
-    updatePlayersState();
+  try {
+    const url = `${PHP_API_URL}/api${endpoint}`;
+    let response;
+    if (method === 'POST') response = await axios.post(url, data);
+    else if (method === 'GET') response = await axios.get(url);
+    return response.data;
+  } catch (error) {
+    console.error(`Erreur API ${endpoint}:`, error.response ? error.response.data : error.message);
+    return { error: 'Erreur d\'API' };
+  }
 }
 
 /**
- * Fonction appelée lorsque le minuteur de la question expire.
- */
+ * Synchronise l'état en mémoire (connectedPlayers) avec la BDD (/players/ready-list).
+ * Important : on reconstruit connectedPlayers en se basant sur la liste renvoyée par l'API
+ * mais on conserve l'id socket et l'état en mémoire (is_ready...) si le joueur est connecté.
+ */
+async function updatePlayersState() {
+  try {
+    const dbPlayers = await fetchPhpApi('/players/ready-list', null, 'GET');
+
+    if (!Array.isArray(dbPlayers)) {
+      console.error("Erreur: /api/players/ready-list n'a pas retourné un tableau:", dbPlayers);
+      return;
+    }
+
+    // Créer une map depuis l'état mémoire pour retrouver rapidement par participantId
+    const inMemoryState = new Map();
+    for (const player of connectedPlayers) {
+      inMemoryState.set(String(player.participantId), {
+        id: player.id,
+        is_ready: !!player.is_ready,
+        has_answered_current_q: !!player.has_answered_current_q,
+        pseudo: player.pseudo,
+        score: player.score || 0,
+        is_admin: !!player.is_admin
+      });
+    }
+
+    // Construire l'état combiné à envoyer au front
+    const newPlayersState = dbPlayers.map(dbPlayer => {
+      const memoryPlayer = inMemoryState.get(String(dbPlayer.id));
+      if (!memoryPlayer) {
+        // Joueur présent en BDD mais pas connecté => on ignore (ou on peut renvoyer avec id null)
+        return null;
+      }
+      return {
+        participantId: dbPlayer.id,
+        pseudo: dbPlayer.pseudo || memoryPlayer.pseudo || `Player${dbPlayer.id}`,
+        score: parseInt(dbPlayer.score || memoryPlayer.score || 0),
+        is_admin: !!dbPlayer.is_admin || memoryPlayer.is_admin,
+        id: memoryPlayer.id,
+        is_ready: memoryPlayer.is_ready,
+        has_answered_current_q: memoryPlayer.has_answered_current_q
+      };
+    }).filter(p => p !== null);
+
+    connectedPlayers = newPlayersState;
+    io.emit('players_update', connectedPlayers);
+  } catch (error) {
+    console.error("Erreur updatePlayersState:", error.message || error);
+  }
+}
+
+async function startQuestionRound() {
+  if (currentQuestionIndex >= questions.length) {
+    return endGame();
+  }
+
+  const currentQ = questions[currentQuestionIndex];
+  if (!currentQ) return endGame();
+
+  currentAnswers = {};
+  console.log(`Démarrage question ${currentQuestionIndex + 1}: ${currentQ.question}`);
+
+  io.emit('new_question', {
+    questionNumber: currentQuestionIndex + 1,
+    totalQuestions: questions.length,
+    id: currentQ.id,
+    questionText: currentQ.question,
+    options: currentQ.answers,
+    timeLimit: QUESTION_TIME_LIMIT
+  });
+
+  if (questionTimer) clearTimeout(questionTimer);
+  questionTimer = setTimeout(processQuestionEnd, QUESTION_TIME_LIMIT * 1000);
+
+  await updatePlayersState();
+}
+
 async function processQuestionEnd() {
-    if (questionTimer) clearTimeout(questionTimer);
-    
-    const currentQ = questions[currentQuestionIndex];
-    if (!currentQ) return;
-    
-    const questionId = currentQ.id;
-    let finalCorrectAnswer = null;
+  if (questionTimer) clearTimeout(questionTimer);
+  const currentQ = questions[currentQuestionIndex];
+  if (!currentQ) return;
 
-    console.log(`Minuteur terminé. Traitement des ${Object.keys(currentAnswers).length} réponses soumises.`);
+  const questionId = currentQ.id;
+  let finalCorrectAnswer = null;
 
-    // --- 1. Vérification et Scoring ---
-    for (const socketId in currentAnswers) {
-        const answerText = currentAnswers[socketId].answer;
-        const player = connectedPlayers.find(p => p.id === socketId);
-        
-        if (player) {
-            const phpResult = await fetchPhpApi('/quiz/answer', {
-                player_id: player.participantId, 
-                question_id: questionId,
-                answer: answerText
-            });
+  console.log(`Minuteur terminé. Réponses reçues: ${Object.keys(currentAnswers).length}`);
 
-            if (phpResult && phpResult.correct_answer) {
-                finalCorrectAnswer = phpResult.correct_answer;
-            }
+  // Traiter chaque réponse envoyée
+  for (const socketId in currentAnswers) {
+    const answerText = currentAnswers[socketId].answer;
+    const player = connectedPlayers.find(p => p.id === socketId);
+    if (!player) continue;
 
-            io.to(socketId).emit('feedback_answer', {
-                isCorrect: phpResult.is_correct || false,
-                correctAnswer: finalCorrectAnswer || '' 
-            });
-        }
-    }
-    
-    // --- 2. Récupération de la réponse correcte finale (si non définie) ---
-    if (!finalCorrectAnswer) {
-        const phpResult = await fetchPhpApi('/quiz/answer', { 
-            player_id: 0, 
-            question_id: questionId,
-            answer: "" 
-        });
-        if (phpResult && phpResult.correct_answer) {
-            finalCorrectAnswer = phpResult.correct_answer;
-        }
-    }
+    const phpResult = await fetchPhpApi('/quiz/answer', {
+      player_id: player.participantId,
+      question_id: questionId,
+      answer: answerText
+    });
 
-    // --- 3. Révélation de la Réponse à tous ---
-    if (finalCorrectAnswer) {
-        io.emit('reveal_answer', { correctAnswer: finalCorrectAnswer });
-    }
+    if (phpResult && phpResult.correct_answer) finalCorrectAnswer = phpResult.correct_answer;
 
-    // --- 4. Préparation pour la prochaine question ---
-    await updatePlayersState(); 
+    io.to(socketId).emit('feedback_answer', {
+      isCorrect: phpResult.is_correct || false,
+      correctAnswer: finalCorrectAnswer || ''
+    });
+  }
 
-    currentQuestionIndex++;
-    
-    setTimeout(startQuestionRound, REVEAL_TIME); 
+  // Si on n'a toujours pas la bonne réponse, demander à l'API sans joueur pour récupérer correct_answer
+  if (!finalCorrectAnswer) {
+    const phpResult = await fetchPhpApi('/quiz/answer', {
+      player_id: 0,
+      question_id: questionId,
+      answer: ""
+    });
+    if (phpResult && phpResult.correct_answer) finalCorrectAnswer = phpResult.correct_answer;
+  }
+
+  if (finalCorrectAnswer) {
+    io.emit('reveal_answer', { correctAnswer: finalCorrectAnswer });
+  }
+
+  await updatePlayersState();
+  currentQuestionIndex++;
+  setTimeout(startQuestionRound, REVEAL_TIME);
 }
 
-
-// Logique de fin de jeu
 async function endGame() {
-    gameStarted = false;
-    currentQuestionIndex = 0;
-    questions = [];
-    currentAnswers = {};
-    if (questionTimer) clearTimeout(questionTimer);
+  gameStarted = false;
+  currentQuestionIndex = 0;
+  questions = [];
+  currentAnswers = {};
+  if (questionTimer) clearTimeout(questionTimer);
 
-    console.log("Jeu terminé. Envoi des scores finaux.");
+  console.log("Jeu terminé. Envoi des scores finaux.");
 
-    try {
-        const finalScores = await fetchPhpApi('/leaderboard', null, 'GET');
-        
-        io.emit('final_scores', finalScores);
-        io.emit('quiz_end');
-        
-        const admin = connectedPlayers.find(p => p.is_admin);
-        const adminId = admin ? admin.participantId : 0;
+  try {
+    const finalScores = await fetchPhpApi('/leaderboard', null, 'GET');
+    io.emit('final_scores', finalScores);
+    io.emit('quiz_end');
 
-        const resetResult = await fetchPhpApi('/game/reset', { admin_id: adminId }); 
-        console.log("État du jeu BDD réinitialisé:", resetResult);
-        
-        await updatePlayersState();
+    const admin = connectedPlayers.find(p => p.is_admin);
+    const adminId = admin ? admin.participantId : 0;
 
-    } catch (error) {
-        console.error("Erreur lors de la fin du jeu ou de la réinitialisation:", error.message);
-    }
+    const resetResult = await fetchPhpApi('/game/reset', { admin_id: adminId });
+    console.log("Réinitialisation BDD:", resetResult);
+
+    await updatePlayersState();
+  } catch (error) {
+    console.error("Erreur endGame:", error.message || error);
+  }
 }
 
-
-// ------------------------------------------
-// Gestion des Sockets (Connexions/Événements)
-// ------------------------------------------
+// Gestion des sockets
 io.on('connection', (socket) => {
-    console.log(`Utilisateur connecté: ${socket.id}`);
+  console.log(`Utilisateur connecté: ${socket.id}`);
 
-    updatePlayersState(); 
+  // Lors d'une connexion on renvoie l'état actuel (utile si quelqu'un reload)
+  socket.emit('connected', { socketId: socket.id });
+  updatePlayersState();
 
-    socket.on('player_info', (playerInfo) => {
-        // ==========================================================
-        // 💡 CORRECTION 3 : Vérifier si le participantId est déjà connecté
-        // ==========================================================
-        if (playerInfo && !connectedPlayers.find(p => p.participantId === playerInfo.participantId)) {
-            connectedPlayers.push({
-                id: socket.id,
-                participantId: playerInfo.participantId,
-                pseudo: playerInfo.pseudo,
-                is_admin: playerInfo.is_admin,
-                score: 0,
-                is_ready: false, // Toujours 'false' à la connexion
-                has_answered_current_q: false,
-            });
-            console.log("Joueur ajouté:", playerInfo.pseudo);
-            updatePlayersState();
-        }
-    });
-    
-    socket.on('disconnect', () => {
-        console.log(`Utilisateur déconnecté: ${socket.id}`);
-        connectedPlayers = connectedPlayers.filter(p => p.id !== socket.id);
-        updatePlayersState(); 
-    });
-    
-    // ==========================================================
-    // 💡 CORRECTION 4 : Logique 'player_ready'
-    // ==========================================================
-    socket.on('player_ready', async (data) => {
-        const player = connectedPlayers.find(p => p.id === socket.id);
-        
-        if (!player || !data || player.participantId !== data.participantId) {
-             console.error("Erreur 'player_ready' : ID non concordant ou joueur non trouvé.");
-             return;
-        }
+  socket.on('player_info', (playerInfo) => {
+    try {
+      // Vérifie qu'on n'a pas déjà ce participant connecté (même participantId)
+      const already = connectedPlayers.find(p => p.participantId === playerInfo.participantId);
+      if (!already) {
+        connectedPlayers.push({
+          id: socket.id,
+          participantId: playerInfo.participantId,
+          pseudo: playerInfo.pseudo,
+          is_admin: playerInfo.is_admin,
+          score: 0,
+          is_ready: false,
+          has_answered_current_q: false
+        });
+        console.log("Joueur ajouté:", playerInfo.pseudo);
+        updatePlayersState();
+      } else {
+        // Si participant déjà en mémoire, on met simplement à jour son socket id
+        already.id = socket.id;
+        already.pseudo = playerInfo.pseudo;
+        already.is_admin = playerInfo.is_admin;
+        console.log("Joueur re-connecté, mise à jour socketId:", playerInfo.pseudo);
+        updatePlayersState();
+      }
+    } catch (err) {
+      console.error("Erreur player_info:", err);
+    }
+  });
 
-        console.log(`Joueur ${player.pseudo} (ID: ${data.participantId}) est prêt.`);
+  socket.on('disconnect', () => {
+    console.log(`Utilisateur déconnecté: ${socket.id}`);
+    connectedPlayers = connectedPlayers.filter(p => p.id !== socket.id);
+    updatePlayersState();
+  });
 
-        try {
-            // 1. Mettre à jour l'état en mémoire D'ABORD
-            player.is_ready = true;
+  socket.on('player_ready', async (data) => {
+    const player = connectedPlayers.find(p => p.id === socket.id);
+    if (!player || !data || player.participantId !== data.participantId) {
+      console.error("Erreur 'player_ready' : joueur non trouvé ou ID non concordant.");
+      socket.emit('error_message', 'Impossible de passer en prêt (incohérence ID).');
+      return;
+    }
 
-            // 2. Appeler l'API PHP pour mettre à jour la BDD
-            await fetchPhpApi('/players/ready', { 
-                player_id: data.participantId 
-            });
+    console.log(`Player ${player.pseudo} ready request`);
 
-            // 3. Mettre à jour l'état de tous les joueurs (il lira 'true' depuis la mémoire)
-            await updatePlayersState();
+    try {
+      // 1) Mettre à jour la mémoire
+      player.is_ready = true;
 
-        } catch (error) {
-            console.error("Erreur lors de la mise à jour de l'état 'prêt':", error.message);
-        }
-    });
-    // ===========================================
-    
+      // 2) Appel API pour marquer prêt
+      await fetchPhpApi('/players/ready', { player_id: data.participantId });
 
-    socket.on('player_answer', (data) => {
-        const player = connectedPlayers.find(p => p.id === socket.id);
-        
-        if (gameStarted && player && currentQuestionIndex < questions.length && !currentAnswers[socket.id]) {
-            const currentQ = questions[currentQuestionIndex];
-            
-            if (data.question_id === currentQ.id) {
-                currentAnswers[socket.id] = {
-                    question_id: data.question_id,
-                    answer: data.answer
-                };
-                
-                console.log(`Réponse stockée pour ${player.pseudo}.`);
-                
-                updatePlayersState(); 
-            }
-        }
-    });
-    
-    socket.on('start_game_request', async (data) => {
-        if (gameStarted) return; 
-        
-        const player = connectedPlayers.find(p => p.id === socket.id);
-        if (!player || !player.is_admin || player.participantId !== data.admin_id) {
-            socket.emit('error_message', 'Action réservée à l’administrateur.');
-            return;
-        }
+      // 3) Broadcast nouvel état
+      await updatePlayersState();
+    } catch (error) {
+      console.error("Erreur player_ready:", error.message || error);
+      socket.emit('error_message', 'Erreur lors de la mise à jour du statut prêt.');
+    }
+  });
 
-        // Vérification si tout le monde est prêt (ajoutée ici pour plus de sécurité)
-        const allReady = connectedPlayers.every(p => p.is_ready);
-        if (connectedPlayers.length < 2 || !allReady) {
-            socket.emit('error_message', 'Il faut au moins 2 joueurs et que tout le monde soit prêt.');
-            return;
-        }
+  socket.on('player_unready', async (data) => {
+    const player = connectedPlayers.find(p => p.id === socket.id);
+    if (!player || !data || player.participantId !== data.participantId) {
+      socket.emit('error_message', 'Impossible d\'annuler le prêt (incohérence ID).');
+      return;
+    }
 
-        // Récupérer les questions aléatoires
-        questions = await fetchPhpApi('/quiz/questions', { userId: player.participantId });
-        
-        if (!questions || !Array.isArray(questions) || questions.length === 0) {
-            console.error("Erreur: Pas de questions valides reçues de l'API.");
-            io.emit('error_message', '❌ Aucune question valide reçue de l\'API. L\'API est peut-être inaccessible.');
-            return;
-        }
+    try {
+      player.is_ready = false;
+      await fetchPhpApi('/players/unready', { player_id: data.participantId });
+      await updatePlayersState();
+    } catch (error) {
+      console.error("Erreur player_unready:", error);
+    }
+  });
 
-        console.log(`Début du jeu avec ${questions.length} questions.`);
+  socket.on('player_answer', (data) => {
+    const player = connectedPlayers.find(p => p.id === socket.id);
+    if (gameStarted && player && currentQuestionIndex < questions.length && !currentAnswers[socket.id]) {
+      const currentQ = questions[currentQuestionIndex];
+      if (data.question_id === currentQ.id) {
+        currentAnswers[socket.id] = {
+          question_id: data.question_id,
+          answer: data.answer
+        };
+        player.has_answered_current_q = true;
+        console.log(`Réponse reçue de ${player.pseudo}`);
+        updatePlayersState();
+      }
+    }
+  });
 
-        const resetResult = await fetchPhpApi('/game/reset', { admin_id: player.participantId });
-        console.log("Réinitialisation avant jeu:", resetResult);
-        
-        gameStarted = true;
-        currentQuestionIndex = 0;
-        
-        io.emit('game_started'); // <-- C'est cet événement
-        startQuestionRound(); 
-    });
+  socket.on('start_game_request', async (data) => {
+    if (gameStarted) {
+      socket.emit('error_message', 'Le jeu a déjà commencé.');
+      return;
+    }
+
+    const player = connectedPlayers.find(p => p.id === socket.id);
+    if (!player || !player.is_admin || player.participantId !== data.admin_id) {
+      socket.emit('error_message', 'Action réservée à l’administrateur.');
+      return;
+    }
+
+    // Tout le monde doit être prêt et au moins 2 joueurs
+    const allReady = connectedPlayers.length > 0 && connectedPlayers.every(p => p.is_ready);
+    if (connectedPlayers.length < 2 || !allReady) {
+      socket.emit('error_message', 'Il faut au moins 2 joueurs et que tout le monde soit prêt.');
+      return;
+    }
+
+    // Récupère les questions depuis l'API
+    const fetched = await fetchPhpApi('/quiz/questions', { userId: player.participantId });
+    if (!fetched || !Array.isArray(fetched) || fetched.length === 0) {
+      console.error("Aucune question valide reçue.");
+      io.to(socket.id).emit('error_message', 'Aucune question valide reçue de l\'API.');
+      return;
+    }
+
+    questions = fetched;
+    console.log(`Début du jeu avec ${questions.length} questions.`);
+
+    try {
+      await fetchPhpApi('/game/reset', { admin_id: player.participantId });
+    } catch (err) {
+      console.warn("Warning reset avant jeu:", err.message || err);
+    }
+
+    gameStarted = true;
+    currentQuestionIndex = 0;
+
+    // Événement cohérent envoyé au front (même nom que le client doit écouter)
+    io.emit('game_started');
+    startQuestionRound();
+  });
 });
 
-
 httpServer.listen(PORT, () => {
-    console.log(`Serveur Node.js Socket.io en cours d'exécution sur le port ${PORT}`);
-    console.log(`API PHP ciblée à: ${PHP_API_URL}`);
+  console.log(`Socket.io server running on port ${PORT}`);
+  console.log(`PHP API: ${PHP_API_URL}`);
 });
