@@ -22,8 +22,8 @@ let questions = [];
 let questionTimer = null; 
 let currentAnswers = {}; 
 
-const QUESTION_TIME_LIMIT = 15; 
-const REVEAL_TIME = 5000; 
+const QUESTION_TIME_LIMIT = 10; 
+const REVEAL_TIME = 4000; 
 
 async function fetchPhpApi(endpoint, data = null, method = 'POST') {
     try {
